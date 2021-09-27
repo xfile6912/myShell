@@ -2,7 +2,25 @@
 #include <errno.h>
 
 #define MAXARGS 128
+sigset_t mask_all, mask_one, prev_one;
 
+typedef struct job_entry *job_link;
+typedef struct job_entry{
+	pid_t pid;//job pid
+	int job_id;//job id
+	char cmdline[MAXLINE];
+	int state;//job의 상태를 저장, -1:아무것도 할당 되지 않은 job, 0:BACKGROUND, 1:FOREGROUND, 2:stopped, 3:done, 4:terminated
+	int job_count;
+	job_link link;
+}Job_Entry;
+
+job_link jobs_head=NULL;
+job_link jobs_tail=NULL;
+int job_count=0;
+
+
+int fg_end_flag=0;//foreground job이 끝났는지 안끝났는지 여부를 체크하는 flag; 1인 경우 끝남.
+int pipe_end_flag=0;//pipe에서 현재 수행하는 명령이 끝났는지 안끝났는지 여부를 체크하는 flag;
 /* Function prototypes */
 void eval(char *cmdline);
 int parseline(char *buf, char **argv);
@@ -14,10 +32,492 @@ void init_sig();
 void sig_int_handler(int sig);
 void sig_stop_handler(int sig);
 void sig_child_handler(int sig);
-sigset_t mask_one, prev_one, mask_all;
-int fg_end_flag=0;//foreground job이 끝났는지 안끝났는지 여부를 체크하는 flag; 1인 경우 끝남.
-int pipe_end_flag=0;//pipe에서 현재 수행하는 명령이 끝났는지 안끝났는지 여부를 체크하는 flag;
-pid_t pid;           /* Process id */
+void init_jobs();
+int get_next_job_id();
+Job_Entry* add_job(pid_t pid, char** argv, int state);
+int get_job_id(pid_t pid);
+Job_Entry* get_job(pid_t pid);
+void delete_job(int job_id);
+void print_jobs();
+void kill_command(char **argv);
+void bg_command(char **argv);
+void fg_command(char **argv);
+int check_plus_minus(int job_count);
+void print_reaped_child();
+int check_plus_minus(int job_count)//+인지 -인지 체크 0인경우 +, 1인경우 -, 2인경우 ' '
+{
+	Job_Entry* ptr;
+	int count=0;//job_count보다 더 높은 것의 개수 체크
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+	{
+		if(job_count<ptr->job_count)
+			count++;
+	}
+
+	if(count>=2)
+		count=2;
+	return count;
+}
+void print_reaped_child()//background프로세스중 done이나 terminated 된것들을 순서대로 출력
+{
+	Job_Entry* ptr;
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+	{
+		if(ptr->state==3)//DONE
+		{
+			Sio_puts("[");
+			Sio_putl((long)(ptr->job_id));
+			Sio_puts("] ");
+			Sio_puts(" DONE	");
+			Sio_putl((long)(ptr->pid));
+			Sio_puts(" ");
+			Sio_puts(ptr->cmdline);
+			Sio_puts("\n");
+		}
+		else if(ptr->state==4)//TERMINATED
+		{
+			Sio_puts("[");
+			Sio_putl((long)(ptr->job_id));
+			Sio_puts("]");
+			Sio_puts(" TERMINATED	");
+			Sio_putl((long)(ptr->pid));
+			Sio_puts(" ");
+			Sio_puts(ptr->cmdline);
+			Sio_puts("\n");
+		}
+			//printf("[%d] RUNNING %d %s\n", ptr->job_id, ptr->pid, ptr->cmdline);
+	}
+	for(ptr=jobs_head; ptr!=NULL; )
+	{
+		Job_Entry *next_ptr=ptr->link;
+		if(ptr->state==3 || ptr->state==4)//done이나 terminated면 job list에서 삭제
+		{
+			delete_job(ptr->job_id);
+		}
+		ptr=next_ptr;
+	}
+}
+
+
+int get_next_job_id()//job_id로 부여될 job number구해줌
+{
+	Job_Entry *ptr;
+	int job_number=1;
+	int i;
+
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)//add 되는 job의 job_id로 부여될 job number구해줌
+	{
+		if(ptr->job_id>=job_number)
+		{
+			job_number=ptr->job_id+1;
+		}
+	}
+	return job_number;
+}
+//job list에 job 추가하고 job id 반환
+Job_Entry* add_job(pid_t pid, char** argv, int state)
+{
+	Job_Entry * new_job=(Job_Entry*)malloc(sizeof(Job_Entry));
+	
+	char cmdline[MAXLINE]="";
+	int i;
+	for(i=0; argv[i]!=NULL; i++)//parsing된 argv를 이용해 cmdline 만들어냄.
+	{
+		strcat(cmdline, argv[i]);
+		strcat(cmdline, " ");
+	}
+
+	int job_number=get_next_job_id();
+
+	new_job->pid=pid;
+	if(state==0)//background process인경우
+	{
+		new_job->job_id=job_number;
+		new_job->job_count=job_count++;
+	}
+	else if(state==1)//foreground process인 경우
+	{
+		new_job->job_id=-1;//일단은 job id를 부여하지 않음
+	}
+	new_job->state=state;
+	strcpy(new_job->cmdline, cmdline);
+	new_job->link=NULL;
+	if(jobs_head==NULL)//job list에 아무것도 없으면 head와 tail이 newjob을 가리킴
+	{
+		jobs_head=new_job;
+		jobs_tail=new_job;
+	}
+	else//job list에 job이 하나라도 있는 경우
+	{
+		jobs_tail->link=new_job;
+		jobs_tail=new_job;
+	}
+	return new_job;
+}
+//pid를 받아서 jobid 리턴 없으면 0 리턴
+int get_job_id(pid_t pid)
+{
+	Job_Entry* ptr;
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+	{
+		if(ptr->pid==pid)//jobs list에서 pid를 찾은 경우
+		{
+			return ptr->job_id;
+		}
+	}
+	return 0;
+}
+//pid를 받아서 job 리턴 없으면 NULL 리턴
+Job_Entry* get_job(pid_t pid)
+{
+	Job_Entry* ptr;
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+	{
+		if(ptr->pid==pid)//jobs list에서 pid를 찾은 경우
+		{
+			return ptr;
+		}
+	}
+	return NULL;
+}
+//job list에서 job_id에 해당하는 job를 삭제
+void delete_job(int job_id)
+{
+	Job_Entry* ptr;
+	Job_Entry* prev_ptr=jobs_head;
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+	{
+		if(ptr->job_id==job_id)//jobs list에서 job id를 찾은 경우
+		{
+			break;
+		}
+		prev_ptr=ptr;
+	}
+	if(ptr==NULL)//joblist에서 job을 찾지 못한 경우
+	{
+		Sio_puts("cannot find job id in jobs\n");
+	}
+	else//job list에서 job을 찾은 경우
+	{
+		if(ptr==jobs_head && ptr==jobs_tail)//하나밖에 없었던 경우에 이제 job list는 비어있게 된다
+		{
+			jobs_head=NULL;
+			jobs_tail=NULL;
+			free(ptr);
+		}
+		else if(ptr==jobs_head)//ptr이 job의 head인 경우
+		{
+			jobs_head=ptr->link;//job list의 head가 ptr의 다음 node를 가리키도록 함
+			free(ptr);
+		}
+		else if(ptr==jobs_tail)//ptr이 job의 tail인 경우
+		{
+			jobs_tail=prev_ptr;//job list의 tail이 ptr의 이전 node를 가리키도록함;
+			jobs_tail->link=NULL;
+			free(ptr);
+		}
+		else//ptr이 job의 중간인 경우
+		{
+			prev_ptr->link=ptr->link;//ptr의 이전 node가 ptr의 다음 node를 가리키도록함
+			free(ptr);
+		}	
+	}
+}
+//jobs 명령시 job list에 있는 job들을 출력해줌.
+void print_jobs()
+{
+	Job_Entry* ptr;
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+	{
+		if(ptr->state==2)
+		{
+			Sio_puts("[");
+			Sio_putl((long)(ptr->job_id));
+			Sio_puts("]");
+			Sio_puts(" STOPPED	");
+			Sio_putl((long)(ptr->pid));
+			Sio_puts(" ");
+			Sio_puts(ptr->cmdline);
+			Sio_puts("\n");
+		}
+			//printf("[%d] STOPPED %d %s\n", ptr->job_id, ptr->pid, ptr->cmdline);
+		else if(ptr->state==0)//background인 경우 뒤에 &붙여줌
+		{
+			Sio_puts("[");
+			Sio_putl((long)(ptr->job_id));
+			Sio_puts("]");
+			Sio_puts(" RUNNING	");
+			Sio_putl((long)(ptr->pid));
+			Sio_puts(" ");
+			Sio_puts(ptr->cmdline);
+			Sio_puts("&\n");
+		}
+			//printf("[%d] RUNNING %d %s&\n", ptr->job_id, ptr->pid, ptr->cmdline);
+		else if(ptr->state==1)
+		{
+			Sio_puts("[");
+			Sio_putl((long)(ptr->job_id));
+			Sio_puts("]");
+			Sio_puts(" RUNNING	");
+			Sio_putl((long)(ptr->pid));
+			Sio_puts(" ");
+			Sio_puts(ptr->cmdline);
+			Sio_puts("\n");
+		}
+		else if(ptr->state==3)//DONE
+		{
+			Sio_puts("[");
+			Sio_putl((long)(ptr->job_id));
+			Sio_puts("]");
+			Sio_puts(" DONE	");
+			Sio_putl((long)(ptr->pid));
+			Sio_puts(" ");
+			Sio_puts(ptr->cmdline);
+			Sio_puts("\n");
+		}
+		else if(ptr->state==4)//TERMINATED
+		{
+			Sio_puts("[");
+			Sio_putl((long)(ptr->job_id));
+			Sio_puts("]");
+			Sio_puts(" TERMINATED	");
+			Sio_putl((long)(ptr->pid));
+			Sio_puts(" ");
+			Sio_puts(ptr->cmdline);
+			Sio_puts("\n");
+		}
+			//printf("[%d] RUNNING %d %s\n", ptr->job_id, ptr->pid, ptr->cmdline);
+	}
+	for(ptr=jobs_head; ptr!=NULL; )
+	{
+		Job_Entry *next_ptr=ptr->link;
+		if(ptr->state==3 || ptr->state==4)//done이나 terminated면 job list에서 삭제
+		{
+			delete_job(ptr->job_id);
+		}
+		ptr=next_ptr;
+	}
+}
+//kill command시 kill해줌
+void kill_command(char **argv)
+{
+	pid_t pid=0;
+	Job_Entry *ptr;
+	
+	char *id=argv[1];
+	
+	if(id[0]=='%')//job 번호인 경우
+	{
+		int job_id=atoi(id+1);
+		for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+		{
+			if(ptr->job_id==job_id)//job_id가 일치하는 job을 job list에서 찾아냄
+			{
+				pid=ptr->pid;
+				break;
+			}
+		}
+	}
+	else//pid 인 경우
+	{
+		pid_t temp_pid=atoi(id);
+		for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+		{
+			if(ptr->pid==temp_pid)//pid가 일치하는 job의 pid를 job list에서 찾아냄
+			{
+				pid=ptr->pid;
+				break;
+			}
+		}
+	}
+
+	if(pid!=0)
+	{
+		if(ptr->state==2)//stopped이면 stopped상태인 거 출력해주고 이후에 termintate 시킴
+		{
+				Sio_puts("[");
+				Sio_putl((long)(ptr->job_id));
+				Sio_puts("]");
+				Sio_puts(" STOPPED	");
+				Sio_putl((long)(ptr->pid));
+				Sio_puts(" ");
+				Sio_puts(ptr->cmdline);
+				Sio_puts("\n");
+		}
+		kill(-pid, SIGCONT);//진행시킨 후
+		kill(-pid, SIGINT);//foreground 프로세스 그룹에 sigint 보내줌.
+	}
+	else
+	{
+		Sio_puts("Cannot find the proccess id in job lists\n");
+	}
+	return;
+}
+//bg command가 들어오면 background에서 돌려줌
+void bg_command(char **argv)
+{
+	pid_t pid=0;
+	Job_Entry* ptr;
+	Job_Entry *last_stopped;//stop된것중 list의 가장 뒤쪽에 있는 것
+	last_stopped=NULL;
+	if(argv[1]==NULL)//인자가 들어오지 않은 경우(jobid가 없는 경우)
+	{
+		for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+		{
+			if(ptr->state==2)//stop인 job을 job list에서 찾아냄
+			{
+				last_stopped=ptr;
+			}
+		}
+		if(last_stopped!=NULL)
+		{
+			Sio_puts("[");
+			Sio_putl((long)(last_stopped->job_id));
+			Sio_puts("] ");
+			Sio_putl((long)(last_stopped->pid));
+			Sio_puts(" ");
+			Sio_puts(last_stopped->cmdline);
+			Sio_puts("&\n");
+			last_stopped->state=0;//bg running으로 바꾸어줌 상태를.
+			kill(-(last_stopped->pid), SIGCONT);//BACKGROUND의 해당 process 프로세스 그룹에 SIGCONT 보내줌.
+		}
+		else
+		{
+			Sio_puts("Cannot run in background(no such jobs or already running in background)\n");
+		}
+	}
+	else//인자가 들어온 경우(jobid가 있는 경우)
+	{
+		int job_id;
+		if(argv[1][0]=='%')
+			job_id=atoi(&argv[1][1]);
+		else
+			job_id=atoi(argv[1]);
+
+		for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+		{
+			if(ptr->job_id==job_id && ptr->state==2)//job_id가 일치하고 stop인 job을 job list에서 찾아냄
+			{
+				pid=ptr->pid;
+				break;
+			}
+		}
+		if(pid!=0)
+		{
+			Sio_puts("[");
+			Sio_putl((long)(ptr->job_id));
+			Sio_puts("] ");
+			Sio_putl((long)(ptr->pid));
+			Sio_puts(" ");
+			Sio_puts(ptr->cmdline);
+			Sio_puts("&\n");
+			ptr->state=0;//bg running으로 바꾸어줌 상태를.
+			kill(-pid, SIGCONT);//BACKGROUND의 해당 process 프로세스 그룹에 SIGCONT 보내줌.
+		}
+		else
+		{
+			Sio_puts("Cannot run in background(no such jobs or already running in background)\n");
+		}
+	}
+
+}
+//fg_command가 들어온경우
+void fg_command(char **argv)
+{
+	pid_t pid=0;
+	sigset_t prev_all;
+	Sigemptyset(&prev_all);
+	Job_Entry* ptr;
+	Job_Entry *last_stopped;//stop된것중 list의 가장 뒤쪽에 있는 것
+	Job_Entry *last_background;//bacground중 list의 가장 뒤쪽에 있는 것
+	last_stopped=NULL;
+	last_background=NULL;
+	if(argv[1]==NULL)//인자가 들어오지 않은 경우(jobid가 들어오지 않은경우)
+	{
+		for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+		{
+			if(ptr->state==2)//stop인 job을 job list에서 찾아냄
+			{
+				last_stopped=ptr;
+			}
+			if(ptr->state==0)
+			{
+				last_background=ptr;
+			}
+		}
+		if(last_stopped!=NULL)
+		{
+
+			last_stopped->state=1;//fg running으로 바꾸어줌 상태를.
+			Sio_puts(last_stopped->cmdline);
+			Sio_puts("\n");
+			kill(-(last_stopped->pid), SIGCONT);//BACKGROUND의 해당 process 프로세스 그룹에 SIGCONT 보내줌.
+			tcsetpgrp(0, last_stopped->pid);
+			while(!fg_end_flag)
+				Sigsuspend(&prev_all);
+			fg_end_flag=0;
+
+			Signal(SIGTTOU, SIG_IGN);
+			tcsetpgrp(0, getpid());
+			Signal(SIGTTOU, SIG_DFL);
+		}
+		else if(last_background!=NULL)
+		{
+
+			last_background->state=1;//fg running으로 바꾸어줌 상태를.
+			Sio_puts(last_background->cmdline);
+			Sio_puts("\n");
+			kill(-(last_background->pid), SIGCONT);//BACKGROUND의 해당 process 프로세스 그룹에 SIGCONT 보내줌
+			tcsetpgrp(0, last_background->pid);
+			while(!fg_end_flag)
+				Sigsuspend(&prev_all);
+			fg_end_flag=0;
+			Signal(SIGTTOU, SIG_IGN);
+			tcsetpgrp(0, getpid());
+			Signal(SIGTTOU, SIG_DFL);
+		}
+		else
+		{
+			Sio_puts("No Such jobs for fg.\n");
+		}
+	}
+	else//job id가 들어온 경우
+	{
+		int job_id;
+		if(argv[1][0]=='%')
+			job_id=atoi(&argv[1][1]);
+		else
+			job_id=atoi(argv[1]);
+		for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+		{
+			if(ptr->job_id==job_id)//job_id가 일치하는 job을 job list에서 찾아냄
+			{
+				pid=ptr->pid;
+				break;
+			}
+		}
+		if(pid!=0)//job list에서 job_id를 찾은 경우
+		{
+			ptr->state=1;//fg running으로 바꾸어줌 상태를.
+			Sio_puts(ptr->cmdline);
+			Sio_puts("\n");
+			kill(-pid, SIGCONT);//BACKGROUND의 해당 process 프로세스 그룹에 SIGCONT 보내줌.
+
+			tcsetpgrp(0, ptr->pid);
+
+			while(!fg_end_flag)
+				Sigsuspend(&prev_all);
+			fg_end_flag=0;
+			Signal(SIGTTOU, SIG_IGN);
+			tcsetpgrp(0, getpid());
+			Signal(SIGTTOU, SIG_DFL);
+		}
+		else//찾지 못한경우
+		{
+			Sio_puts("Cannot find the job in job lists\n");
+		}
+	}
+}
 void init_sig()
 {
 	Sigfillset(&mask_all);
@@ -26,61 +526,123 @@ void init_sig()
 	Signal(SIGCHLD, sig_child_handler);
 	Signal(SIGINT, sig_int_handler);
 	Signal(SIGTSTP, sig_stop_handler);
-	Signal(SIGTTOU, SIG_IGN);
 	Signal(SIGTTIN, SIG_IGN);
+	pid_t pid = getpid();
+	setpgid(pid, pid);
+	tcsetpgrp(0, pid);
 }
 void sig_int_handler(int sig)
 {
+	pid_t pid=0;
+	Job_Entry *ptr;
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+	{
+		if(ptr->state==1)//foreground job찾음
+		{
+			pid=ptr->pid;
+			break;
+		}
+	}
+	//printf("%d", pid);
 	if(pid!=0)
 	{
 		kill(-pid, SIGINT);//foreground 프로세스 그룹에 sigint 보내줌.
+		tcsetpgrp(STDERR_FILENO, getpgrp());
 	}
 	return;
 }
 void sig_stop_handler(int sig)
 {
+	pid_t pid=0;
+	Job_Entry *ptr;
+	for(ptr=jobs_head; ptr!=NULL; ptr=ptr->link)
+	{
+		//		printf("state: %d\n", ptr->state);
+		if(ptr->state==1)//foreground job찾음
+		{
+			pid=ptr->pid;
+			break;
+		}
+	}
+	//printf("%d\n", pid);
 	if(pid!=0)
 	{
-		kill(-pid, SIGINT);//foreground 프로세스 그룹에 SIGINT
+		kill(-pid, SIGTSTP);//foreground 프로세스 그룹에 SIGTSTP 보내줌.
+		tcsetpgrp(STDERR_FILENO, getpgrp());
 	}
 	return;
 }
 void sig_child_handler(int sig)
 {
-int olderrno=errno;
-	sigset_t mask_all, prev_all;
+	int olderrno=errno;
 	pid_t pid;
 	int status;
-	Sigfillset(&mask_all);
-	//wnohang: 자식이 종료되지 않았떠라도 함수는 바로 리턴하게 끔 해줌
-	//wuntraced: 종료된 프로세스 뿐만 아니라 멈춘 프로세스로부터도 상태정보 얻어옴.
-	while((pid=waitpid(-1, &status, WNOHANG | WUNTRACED))>0)//종료된 프로세스와 중단된 프로세스의 상태를 받음
+	while((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0)//종료된 프로세스와 중단된 프로세스의 상태를 받음
 	{
-		Sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
-		//child가 중단된 경우나 //child가 정상적으로 종료된 경우나 //child가 signal에 의해 종료된 경우
-		if(WIFSTOPPED(status) || WIFEXITED(status) || WIFSIGNALED(status))
+		//printf("%d\n", pid);
+		if (WIFSTOPPED(status))//child가 중단된 경우
 		{
-			fg_end_flag=1;//parent 프로세스가 기다리는 것을 끝내도록 함
+			//printf("%d\n", 1);
+			Job_Entry* job = get_job(pid);
+			
+			if (job->state == 1)//foreground인 경우
+			{
+				if (job->job_id == -1)//job_id가 처음에 add되지 않고foreground로 지정된 잡이 stop된경우
+				{
+					//job의 job_id를 새로 할당해줌.
+					job->job_id = get_next_job_id();
+				}
+				job->job_count=job_count++;
+				Sio_puts("[");
+				Sio_putl((long)(job->job_id));
+				Sio_puts("] STOPPED	");
+				Sio_putl((long)(job->pid));
+				Sio_puts(" ");
+				Sio_puts(job->cmdline);
+				Sio_puts("\n");
+				job->state = 2;//stopped로 상태 바꾸어줌
+				fg_end_flag = 1;//parent 프로세스가 기다리는 것을 끝내도록 함
+			}
+			else//background인 경우
+			{
+				job->state = 2;//stopped로 상태 바꾸어줌
+			}
+
 		}
-		Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+		else if (WIFEXITED(status))//child가 정상적으로 종료된 경우
+		{
+			//printf("%d\n", 2);
+			Job_Entry* job = get_job(pid);
+			if (job->state == 1)//foreground
+			{
+				fg_end_flag = 1;//parent 프로세스가 기다리는 것을 끝내도록 함.
+				delete_job(job->job_id);//foreground프로세스의 경우 나중에 출력이 필요없기 때문에 바로 delete해줌
+			}
+			else//background
+			{
+				job->state=3;//backgorund의 경우 나중에 done이라는 출력이 필요하므로 jobstate를 3으로 바꾸저줌
+			}
+		}
+		else if (WIFSIGNALED(status))//child가 signal에 의해 종료된 경우
+		{
+			Job_Entry* job = get_job(pid);
+
+
+			if (job->state == 1)//foreground job인 경우에는
+			{
+				fg_end_flag = 1;
+				delete_job(job->job_id);//foreground 프로세스의 경우 나중에 출력이 필요없기 때문에 바로 delete해줌
+			}
+			else
+			{
+				job->state=4;//background의 경우 나중에 terminate라는 출력이 필요하므로 job state를 4로 바꾸어줌
+			}
+		}
 	}
 	errno=olderrno;
 }
-void Exec(char *filename, char *const argv[], char *const envp[])
-{
-	if (execve(filename, argv, environ) < 0)
-	{
-		///bin/에 없는 경우 user/bin에서 찾아봄
-		strcpy(filename, "/usr/bin/");
-		strcat(filename, argv[0]);
-		if(execve(filename, argv, environ) < 0)
-		{
-			printf("%s: Command not found.\n", argv[0]);
-			exit(0);
-		}
-	}
 
-}
+
 void sig_child_in_pipe_handler(int sig)
 {
 	int olderrno=errno;
@@ -102,6 +664,24 @@ void sig_child_in_pipe_handler(int sig)
 	}
 	errno=olderrno;
 }
+
+void Exec(char *filename, char *const argv[], char *const envp[])
+{
+	if (execve(filename, argv, environ) < 0)
+	{
+		///bin/에 없는 경우 user/bin에서 찾아봄
+		strcpy(filename, "/usr/bin/");
+		strcat(filename, argv[0]);
+		if(execve(filename, argv, environ) < 0)
+		{
+			Sio_puts(argv[0]);
+			Sio_puts(": Command not found.\n");
+			exit(0);
+		}
+	}
+
+}
+
 int pipe_execution(char **p_command, int p_command_cnt)
 {
 	int i;
@@ -131,6 +711,7 @@ int pipe_execution(char **p_command, int p_command_cnt)
 
 		if((pid=Fork())==0)
 		{
+			setpgid(0, getppid());
 			if(i==0)//가장 앞에 있는 명령의 경우
 			{
 				close(pipefd[i][0]);///////나중에 들어감
@@ -145,7 +726,7 @@ int pipe_execution(char **p_command, int p_command_cnt)
 				close(pipefd[i-1][1]);//////나중에 들어감
 				dup2(pipefd[i-1][0], STDIN_FILENO);
 				close(pipefd[i-1][0]);
-				//close(pipefd[i-1][1]);//나중에 들어간거 빼면 이거 주석 풀어야함
+
 				Exec(argv0, argv, environ);
 			}
 			else//나머지 의 경우
@@ -156,10 +737,10 @@ int pipe_execution(char **p_command, int p_command_cnt)
 				close(pipefd[i][1]);
 				Exec(argv0, argv, environ);
 			}
-		} 
+		}
 		close(pipefd[i][1]);//나중에 들어감pipefd[i][0]은 닫아주면 안됨(부모가 다음 자식에게 전달해줘야하므로)
 		while(!pipe_end_flag)//pipe 하나의 명령이 끝날때까지 명시적으로 기다리기 위해서
-					Sigsuspend(&prev_all);
+			Sigsuspend(&prev_all);
 		pipe_end_flag=0;
 	}
 	exit(0);
@@ -196,23 +777,22 @@ void normalize_cmdline(char * cmdline)
 void eval(char *cmdline)
 {
 
-	//todo: pipe parsing 문제 해결하기 ex)grep filename|ls -al 붙어있는경우
 	char *argv[MAXARGS]; /* Argument list execve() */
 	char buf[MAXLINE];   /* Holds modified command line(for argv) */
 	char buf2[MAXLINE];  /* Holds modified command line (for piped command)*/
 	int bg;              /* Should the job run in bg or fg? */
-
+	pid_t pid;           /* Process id */
 	int pipe_flag=0;//pipe가 있는지 없는지 저장
 	int i;
-
-
-
+	Job_Entry* job;
+	sigset_t prev_all;
+	Sigemptyset(&prev_all);
 	normalize_cmdline(cmdline);//cmdline을 적절한 형식으로 변화시켜줌 ' '단위로 분리시켜줌
 	//space단위로 나중에 parsing하기 때문에
 
 	strcpy(buf, cmdline);//buf에 commandline 복사
 	bg = parseline(buf, argv);//parsing 수행
-
+	   
 	if (argv[0] == NULL)
 		return; /* Ignore empty lines */
 	if (!builtin_command(argv))
@@ -225,10 +805,28 @@ void eval(char *cmdline)
 		int p_start=0;//pipe 단위로 쪼개지는 각각의 command의 시작점을 저장하는 변수
 		strcpy(buf2, cmdline);//임시 공간 buf2에 cmdline 저장
 		int i;
-		Sigprocmask(SIG_BLOCK, &mask_one, &prev_one);
+		//addjob을 하기전에 SIGCHLD가 호출되면 delete가 먼저 수행될 수 있으므로 sigchild를 막아놈
+
+		if (!bg)
+		{
+			job = add_job(-1, argv, 1);//ADD the foreground Child to the job list
+		}
+		else
+		{
+			job = add_job(-1, argv, 0);//ADD the background Child to the job list
+		}
+
 		if((pid=Fork())==0)
 		{
-			setpgid(0, 0);
+			Signal(SIGTTOU, SIG_DFL);
+			Signal(SIGTTIN, SIG_DFL);
+			if (job->pid > 0)
+				setpgid(0, job->pid);
+			else
+			{
+				job->pid = getpid();
+				setpgid(0, job->pid);
+			}
 			//pipe 있는지 체크;
 			for(i=0; i<strlen(cmdline); i++)//strlen(buf2)를 쓰게되면 중간에 strlen이 변하게 됨('\0'를 넣어주게 되므로)
 			{
@@ -250,24 +848,38 @@ void eval(char *cmdline)
 			{
 				Exec(argv0, argv, environ);
 			}
+			exit(0);
 		}
 		/* Parent waits for foreground job to terminate */
 		else
 		{
-			setpgid(pid, 0);
+			if (job->pid > 0)
+				setpgid(pid, job->pid);
+			else
+			{
+				job->pid = pid;
+				setpgid(pid, job->pid);
+			}
 			if (!bg)
 			{
-				tcsetpgrp(STDERR_FILENO, pid);
+				tcsetpgrp(0, pid);
 				int status;
-				Sigprocmask(SIG_BLOCK, &mask_all, NULL);
-				while(!fg_end_flag)//foreground job을 명시적으로 기다리기 위해서
-					Sigsuspend(&prev_one);
+				while(!fg_end_flag)
+					Sigsuspend(&prev_all);
 				fg_end_flag=0;
-				Sigprocmask(SIG_SETMASK, &prev_one, NULL);//unblock sigchild
-				tcsetpgrp(STDERR_FILENO, getpgrp());
+
+				Signal(SIGTTOU, SIG_IGN);
+				tcsetpgrp(0, getpid());
+				Signal(SIGTTOU, SIG_DFL);
 			}
 			else //when there is backgrount process!
-				printf("%d %s", pid, cmdline);
+			{
+				Sio_puts("[");
+				Sio_putl((long)(job->job_id));
+				Sio_puts("] ");
+				Sio_putl((long)(job->pid));
+				Sio_puts("\n");
+			}
 		}
 	}
 	return;
@@ -282,6 +894,27 @@ int builtin_command(char **argv)
 		exit(0);
 	if (!strcmp(argv[0], "&")) /* Ignore singleton & */
 		return 1;
+
+	if(!strcmp(argv[0], "jobs"))
+	{
+		print_jobs();
+		return 1;
+	}
+	if(!strcmp(argv[0], "bg"))
+	{
+		bg_command(argv);
+		return 1;
+	}
+	if(!strcmp(argv[0], "fg"))
+	{
+		fg_command(argv);
+		return 1;
+	}
+	if(!strcmp(argv[0], "kill"))
+	{
+		kill_command(argv);
+		return 1;
+	}
 	if (!strcmp(argv[0], "cd"))
 	{
 		if (argv[1] == NULL)
@@ -299,9 +932,6 @@ int builtin_command(char **argv)
 	return 0; /* Not a builtin command */
 }
 /* $end eval */
-
-/* $begin parseline */
-/* parseline - Parse the command line and build the argv array */
 int parseline(char *buf, char **argv)
 {
 	char *delim; /* Points to first space delimiter */
